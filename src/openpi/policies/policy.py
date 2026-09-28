@@ -65,10 +65,41 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(
+        self, obs: dict, *, noise: np.ndarray | None = None,
+        rtc_prefix: np.ndarray | None = None, rtc_prefix_length: int | None = None,
+    ) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        rtc_enabled = rtc_prefix_length is not None
+        raw_prefix = None
+        if rtc_enabled:
+            if self._is_pytorch_model or not getattr(self._model, "pi05", False):
+                raise ValueError("Train-time RTC is supported only by the JAX pi05 model")
+            max_delay = getattr(self._model, "rtc_training_max_delay", 0)
+            if max_delay <= 0:
+                raise ValueError("This policy was not configured for train-time RTC")
+            if type(rtc_prefix_length) is not int or not 0 <= rtc_prefix_length <= max_delay:
+                raise ValueError(f"rtc_prefix_length must be an integer in [0, {max_delay}]")
+            raw_state = np.asarray(obs["state"], dtype=np.float32)
+            if raw_state.ndim != 1 or not np.isfinite(raw_state).all():
+                raise ValueError("RTC state must be a finite 1D vector")
+            if rtc_prefix is None:
+                if rtc_prefix_length:
+                    raise ValueError("A nonzero RTC prefix length requires prefix actions")
+                raw_prefix = np.empty((0, raw_state.size), dtype=np.float32)
+            else:
+                raw_prefix = np.array(rtc_prefix, dtype=np.float64, copy=True)
+                if raw_prefix.shape != (rtc_prefix_length, raw_state.size) or not np.isfinite(raw_prefix).all():
+                    raise ValueError("RTC prefix must be finite [prefix_length, state_dim] absolute actions")
+            # Use CURRENT observation state, the same DeltaActions/Normalize/Pad as training.
+            # Pad horizon before transforming; only the selected prefix will be clamped.
+            inputs["actions"] = np.zeros((self._model.action_horizon, raw_state.size), dtype=np.float32)
+            inputs["actions"][:rtc_prefix_length] = raw_prefix
+        elif rtc_prefix is not None:
+            raise ValueError("rtc_prefix requires rtc_prefix_length")
         inputs = self._input_transform(inputs)
+        transformed_prefix = inputs.pop("actions") if rtc_enabled else None
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -80,6 +111,10 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        # Bootstrap uses the unchanged scalar-time sampler, with no prefix to clamp.
+        if rtc_enabled and rtc_prefix_length > 0:
+            sample_kwargs["rtc_prefix"] = jnp.asarray(transformed_prefix)[None, ...]
+            sample_kwargs["rtc_prefix_length"] = jnp.asarray(rtc_prefix_length, dtype=jnp.int32)
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
@@ -93,6 +128,9 @@ class Policy(BasePolicy):
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
+        # JAX dispatch is asynchronous; include actual device execution in timing.
+        if not self._is_pytorch_model:
+            jax.block_until_ready(outputs["actions"])
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
@@ -100,6 +138,16 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        if rtc_enabled:
+            # Avoid small normalization round-trip error in committed physical actions.
+            outputs["actions"] = np.array(outputs["actions"], dtype=np.float64, copy=True)
+            outputs["actions"][:rtc_prefix_length] = raw_prefix
+            outputs["rtc"] = {
+                "applied": True,
+                "mode": "train_time_prefix",
+                "prefix_length": rtc_prefix_length,
+                "max_prefix_length": self._model.rtc_training_max_delay,
+            }
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

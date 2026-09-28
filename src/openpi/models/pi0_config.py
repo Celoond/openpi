@@ -29,12 +29,18 @@ class Pi0Config(_model.BaseModelConfig):
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
     pi05: bool = False
+    # Clean action prefix length used by train-time RTC (0 disables RTC).
+    rtc_training_max_delay: int = 0
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
+        if type(self.rtc_training_max_delay) is not int or not (
+            0 <= self.rtc_training_max_delay < self.action_horizon
+        ):
+            raise ValueError("rtc_training_max_delay must satisfy 0 <= delay < action_horizon")
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:

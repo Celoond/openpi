@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.flexiv_policy as flexiv_policy
+import openpi.policies.piper_policy as piper_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -519,6 +520,62 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotPiperDataConfig(DataConfigFactory):
+    # If true, will convert eef-pose dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    # [x, y, z, r1, ..., r6, left_gripper, x, y, z, r1, ..., r6, right_gripper]
+    use_delta_eef_actions: bool = True
+    # Compact mask groups passed to make_bool_mask. Use (9, -1) for single-arm
+    # eef_pose and (9, -1, 9, -1) for dual-arm eef_pose.
+    delta_eef_action_mask: Sequence[int] = (9, -1, 9, -1)
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.third_view",
+                        "observation/left_wrist_image": "observation.images.left_wrist_view",
+                        "observation/right_wrist_image": "observation.images.right_wrist_view",
+                        "state": "observation.state.eef_pose",
+                        "actions": "actions.eef_pose",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("actions.eef_pose",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[piper_policy.PiperInputs(model_type=model_config.model_type)],
+            outputs=[piper_policy.PiperOutputs()],
+        )
+        if self.use_delta_eef_actions:
+            delta_action_mask = _transforms.make_bool_mask(*self.delta_eef_action_mask)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -614,6 +671,17 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    # Portable 20D dual-arm EEF RTC serving template. Match asset_id to the checkpoint.
+    TrainConfig(
+        name="aloha_eef_rtc",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50, rtc_training_max_delay=8),
+        data=LeRobotPiperDataConfig(
+            repo_id="aloha_eef",
+            assets=AssetsConfig(asset_id="aloha_eef"),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_eef_actions=True,
+        ),
+    ),
     # Flexiv train-time RTC checkpoint serving configuration.
     # Beta time schedule (use_ln_scheduler=False on the training host).
     TrainConfig(

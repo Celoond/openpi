@@ -13,21 +13,24 @@ from openpi.models import gemma, pi0
 from openpi.models.model import ModelType
 from openpi.policies.policy import Policy
 from openpi.policies.flexiv_policy import FlexivInputs, FlexivOutputs
+from openpi.policies.piper_policy import PiperInputs, PiperOutputs
 from openpi_zmq_server import PIZmqServer
 
 
-def make_policy():
+def make_policy(action_dim=10):
     p = object.__new__(Policy)
     p._model = SimpleNamespace(pi05=True, rtc_training_max_delay=8, action_horizon=50)
     p._is_pytorch_model = False
     p._rng = jax.random.key(0)
     p._sample_kwargs = {}
-    stats = {k: tr.NormStats(mean=np.zeros(10), std=np.ones(10), q01=-np.ones(10), q99=np.ones(10)*3)
+    stats = {k: tr.NormStats(mean=np.zeros(action_dim), std=np.ones(action_dim), q01=-np.ones(action_dim), q99=np.ones(action_dim)*3)
              for k in ('state', 'actions')}
-    p._input_transform = tr.compose([FlexivInputs(ModelType.PI05), tr.DeltaActions(tr.make_bool_mask(9, -1)),
+    inputs_type, outputs_type = (FlexivInputs, FlexivOutputs) if action_dim == 10 else (PiperInputs, PiperOutputs)
+    delta_mask = tr.make_bool_mask(*((9, -1) * (action_dim // 10)))
+    p._input_transform = tr.compose([inputs_type(ModelType.PI05), tr.DeltaActions(delta_mask),
                                      tr.Normalize(stats, use_quantiles=True), tr.PadStatesAndActions(32)])
     p._output_transform = tr.compose([tr.Unnormalize(stats, use_quantiles=True),
-                                      tr.AbsoluteActions(tr.make_bool_mask(9, -1)), FlexivOutputs()])
+                                      tr.AbsoluteActions(delta_mask), outputs_type()])
     calls = []
     def sample(rng, obs, **kwargs):
         calls.append(kwargs)
@@ -36,26 +39,31 @@ def make_policy():
     return p, calls
 
 
-def observation():
+def observation(action_dim=10):
+    if action_dim == 20:
+        return {'state': np.arange(20, dtype=np.float32)/10,
+                **{key: np.zeros((224,224,3), np.uint8) for key in
+                   ('observation/image', 'observation/left_wrist_image', 'observation/right_wrist_image')}}
     return {'state': np.arange(10, dtype=np.float32)/10,
             'observation/image': np.zeros((224,224,3), np.uint8),
             'observation/wrist_image': np.zeros((224,224,3), np.uint8)}
 
 
+@pytest.mark.parametrize("action_dim", [10, 20])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-def test_prefix_transforms_current_state_and_roundtrip(dtype):
-    p, calls = make_policy()
-    obs = observation()
-    prefix = np.tile(np.arange(10, dtype=dtype) + 0.123456789, (8,1))
+def test_prefix_transforms_current_state_and_roundtrip(dtype, action_dim):
+    p, calls = make_policy(action_dim)
+    obs = observation(action_dim)
+    prefix = np.tile(np.arange(action_dim, dtype=dtype) + 0.123456789, (8,1))
     original = prefix.copy()
     out = p.infer(obs, rtc_prefix=prefix, rtc_prefix_length=8)
-    delta = prefix-obs['state']; delta[:,9] = prefix[:,9]
+    delta = prefix-obs['state']; delta[:,9::10] = prefix[:,9::10]
     expected = (delta+1)/(4+1e-6)*2-1
-    np.testing.assert_allclose(calls[0]['rtc_prefix'][0,:8,:10], expected, atol=1e-6)
-    np.testing.assert_array_equal(calls[0]['rtc_prefix'][0,:8,10:], 0)
+    np.testing.assert_allclose(calls[0]['rtc_prefix'][0,:8,:action_dim], expected, atol=1e-6)
+    np.testing.assert_array_equal(calls[0]['rtc_prefix'][0,:8,action_dim:], 0)
     np.testing.assert_array_equal(out['actions'][:8], original)
     np.testing.assert_array_equal(prefix, original)
-    assert out['rtc']['applied'] and out['actions'].shape == (50,10)
+    assert out['rtc']['applied'] and out['actions'].shape == (50,action_dim)
     obs['state'] += 0.2
     p.infer(obs, rtc_prefix=prefix, rtc_prefix_length=8)
     assert not np.allclose(calls[0]['rtc_prefix'], calls[1]['rtc_prefix'])
@@ -75,10 +83,11 @@ def test_invalid_prefix(prefix):
         p.infer(observation(), rtc_prefix=prefix, rtc_prefix_length=8)
 
 
-def test_wire_protocol_bootstrap_and_fail_closed():
+@pytest.mark.parametrize("action_dim", [10, 20])
+def test_wire_protocol_bootstrap_and_fail_closed(action_dim):
     server = PIZmqServer()
-    server._policy, _ = make_policy()
-    msg = {k:v.tolist() for k,v in observation().items()}
+    server._policy, _ = make_policy(action_dim)
+    msg = {k:v.tolist() for k,v in observation(action_dim).items()}
     def send(**fields):
         return server._handle_request(msgpack.packb({**msg, **fields}))
     bootstrap = send(cmd='predict_rtc', rtc={'prefix_length':0})
@@ -127,3 +136,47 @@ def test_token_time_matches_scalar_time():
     variables = norm.init(jax.random.key(0),x,embedding)
     for a,b in zip(norm.apply(variables,x,embedding),norm.apply(variables,x,token_embedding)):
         np.testing.assert_allclose(jnp.broadcast_to(a,b.shape),b)
+
+
+@pytest.mark.parametrize("action_dim", [10, 20])
+@pytest.mark.parametrize("length", [0, 4, 8])
+def test_wire_rtc_layout_matches_loaded_policy(action_dim, length):
+    server = PIZmqServer()
+    server._policy, calls = make_policy(action_dim)
+    obs = observation(action_dim)
+    prefix = np.tile(obs["state"], (length, 1)).astype(np.float64)
+    prefix[:, 9::10] = -0.02
+    request = {k: v.tolist() for k, v in obs.items()}
+    request.update(cmd="predict_rtc", rtc={"prefix_length": length, "prefix_actions": prefix.tolist()})
+    out = server._handle_request(msgpack.packb(request))
+    assert out["status"] == "ok"
+    assert np.asarray(out["actions"]).shape == (50, action_dim)
+    np.testing.assert_array_equal(np.asarray(out["actions"])[:length], prefix)
+    assert out["rtc"]["prefix_length"] == length and out["rtc"]["applied"]
+    assert ("rtc_prefix" in calls[-1]) == (length > 0)
+    if length == 0:
+        ordinary = server._handle_request(msgpack.packb({**request, "cmd": "predict", "rtc": {}}))
+        assert ordinary["status"] == "error"
+        plain = {k: v for k, v in request.items() if k != "rtc"}
+        plain["cmd"] = "predict"
+        np.testing.assert_array_equal(out["actions"], server._handle_request(msgpack.packb(plain))["actions"])
+    request["state"] = [0.] * (20 if action_dim == 10 else 10)
+    count = len(calls)
+    bad = server._handle_request(msgpack.packb(request))
+    assert bad["status"] == "error"
+    assert f"{action_dim}D" in bad["message"]
+    assert len(calls) == count
+
+
+def test_public_aloha_config_builds_bimanual_transforms(monkeypatch, tmp_path):
+    from openpi.training import config
+    c = config.get_config("aloha_eef_rtc")
+    monkeypatch.setattr(config.DataConfigFactory, "_load_norm_stats", lambda *a: None)
+    monkeypatch.setattr(config.ModelTransformFactory, "__call__", lambda *a: tr.Group())
+    data = c.data.create(tmp_path, c.model)
+    assert c.model.rtc_training_max_delay == 8 and c.model.action_horizon == 50
+    assert c.model.action_dim == 32
+    assert isinstance(data.data_transforms.inputs[0], PiperInputs)
+    delta = next(t for t in data.data_transforms.inputs if isinstance(t, tr.DeltaActions))
+    np.testing.assert_array_equal(delta.mask, [True]*9+[False]+[True]*9+[False])
+    assert isinstance(data.data_transforms.outputs[-1], PiperOutputs)

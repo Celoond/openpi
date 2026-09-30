@@ -325,3 +325,7 @@ We will collect common issues and their solutions here. If you encounter an issu
 ## Flexiv ZMQ / train-time RTC serving
 
 See [Flexiv RTC serving](docs/flexiv_plug_rtc_inference.md) for the InferSystem-compatible ZMQ protocol, checkpoint layout, and tests. Ordinary prediction remains supported.
+
+### Aloha/Piper RTC serving
+
+See [20D dual-arm EEF RTC serving](docs/aloha_eef_rtc_inference.md) for the matching client contract and portable configuration.

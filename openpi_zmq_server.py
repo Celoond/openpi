@@ -8,7 +8,7 @@
     {"cmd": "predict", "state": [float, ...], "prompt": str, "extra": {...},
      "top_head": bytes(JPEG), "hand_left": bytes(JPEG), "hand_right": bytes(JPEG)}
     {"cmd": "predict_rtc", ...same observation fields...,
-     "rtc": {"prefix_length": 0..8, "prefix_actions": [[absolute EEF 10D], ...]}}
+     "rtc": {"prefix_length": 0..8, "prefix_actions": [[absolute EEF 10D or 20D], ...]}}
     {"cmd": "reset"}
 
   响应:
@@ -169,6 +169,20 @@ class PIZmqServer:
         for i, t in enumerate(self._policy._output_transform.transforms):
             logger.info("  output_transform[%d]: %s", i, type(t).__name__)
 
+    def _rtc_action_dim(self) -> int:
+        """Bind the wire layout to the loaded policy, not to client-supplied data."""
+        from openpi.policies.flexiv_policy import FlexivInputs
+        from openpi.policies.piper_policy import PiperInputs
+
+        dimensions = {
+            20 if isinstance(transform, PiperInputs) else 10
+            for transform in self._policy._input_transform.transforms
+            if isinstance(transform, (PiperInputs, FlexivInputs))
+        }
+        if len(dimensions) != 1:
+            raise ValueError("RTC requires a Flexiv 10D or Piper/Aloha 20D EEF policy")
+        return dimensions.pop()
+
     def predict(self, msg: dict[str, Any]) -> dict[str, Any]:
         """处理单次推理请求。"""
         obs = _build_obs(msg)
@@ -181,8 +195,9 @@ class PIZmqServer:
             length = rtc.get("prefix_length")
             if type(length) is not int:
                 raise ValueError("rtc.prefix_length must be an explicit integer, including 0 for bootstrap")
-            if obs["state"].shape != (10,):
-                raise ValueError("Flexiv RTC expects a 10D EEF state")
+            action_dim = self._rtc_action_dim()
+            if obs["state"].shape != (action_dim,):
+                raise ValueError(f"Loaded RTC policy expects a {action_dim}D EEF state")
             prefix = rtc.get("prefix_actions")
             if length == 0 and isinstance(prefix, list) and not prefix:
                 prefix = None

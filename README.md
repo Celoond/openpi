@@ -11,6 +11,18 @@ For all models, we provide _base model_ checkpoints, pre-trained on 10k+ hours o
 
 This is an experiment: $\pi_0$ was developed for our own robots, which differ from the widely used platforms such as [ALOHA](https://tonyzhaozh.github.io/aloha/) and [DROID](https://droid-dataset.github.io/), and though we are optimistic that researchers and practitioners will be able to run creative new experiments adapting $\pi_0$ to their own platforms, we do not expect every such attempt to be successful. All this is to say: $\pi_0$ may or may not work for you, but you are welcome to try it and see!
 
+## What's New
+
+- **2026-11-12 — Preserve source image geometry during conversion.** Added an episode-parallel raw-to-LeRobot converter that keeps each camera's original resolution and writes matching video metadata. Resizing and padding remain training-time transforms. Video streams are re-encoded; existing datasets are not changed. The serial helper retains its legacy 224×224 behavior when run directly.
+
+```bash
+python scripts/convert_data_to_lerobot_parallel.py \
+  --src /path/to/raw_episodes --repo-id example_dataset \
+  --task "Describe the task" --episode-workers 8
+```
+
+Use a new dataset ID when regenerating data: the converter replaces an existing output dataset. Source-resolution decoding uses more memory than 224×224 decoding; reduce worker counts if needed.
+
 ## Updates
 
 - [Sept 2025] We released PyTorch support in openpi.
